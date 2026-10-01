@@ -1,7 +1,6 @@
-import * as comlink from "comlink";
 import type { ConvertPathNode, FileData, HandlerDefinition } from "./FormatHandler";
-import { createRemoteContext, type IProgressStore } from "./ui/ProgressStore";
 import { getHandler, type HandlerName } from "./handlers/index.js";
+import { createRemoteContext, type IProgressStore } from "./ProgressStore.js";
 
 if (!("window" in globalThis)) {
   (globalThis as unknown as { window: typeof globalThis }).window = globalThis;
@@ -39,13 +38,8 @@ export class Converter {
     inputFiles: FileData[],
     { currentStep, totalSteps }: { currentStep: number; totalSteps: number },
     progressStore: IProgressStore,
-    abortPort: MessagePort,
   ): Promise<ConvertResult> {
     const controller = new AbortController();
-    abortPort.addEventListener("message", ({ data }) => {
-      if (data === "abort") controller.abort();
-    });
-    abortPort.start();
 
     const ctx = createRemoteContext(progressStore, handlerDef.name, controller.signal);
 
@@ -86,20 +80,16 @@ export class Converter {
       const outputFiles = (
         await Promise.all([
           handler.doConvert(inputFiles, inputFormat, path[1].format, undefined, ctx),
-          new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))),
+	        new Promise(resolve => setTimeout(resolve, 1)),
         ])
       )[0];
 
-      ctx.log(`Step ${currentStep}/${totalSteps} complete`);
       if (outputFiles.some((c) => !c.bytes.length)) throw "Output is empty.";
 
-      return comlink.transfer({ ok: true, inputFiles, outputFiles }, [
-        ...new Set([...inputFiles, ...outputFiles].map((file) => file.bytes.buffer)),
-      ]);
+      return { ok: true, inputFiles, outputFiles };
     } catch (e) {
       const error = e instanceof Error ? e : new Error(String(e));
-      return comlink.transfer(
-        {
+      return {
           ok: false,
           inputFiles,
           error: {
@@ -107,13 +97,8 @@ export class Converter {
             message: error.message,
             stack: error.stack,
           },
-        },
-        [...new Set([...inputFiles].map((file) => file.bytes.buffer))],
-      );
+        };
     } finally {
-      abortPort.close();
     }
   }
 }
-
-if (typeof document === "undefined") comlink.expose(Converter);

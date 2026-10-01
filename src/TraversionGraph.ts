@@ -1,6 +1,5 @@
-import { ConvertPathNode, type FileFormat, type HandlerDefinition } from "./FormatHandler.ts";
-import { PriorityQueue } from "./PriorityQueue.ts";
-import * as comlink from "comlink";
+import { ConvertPathNode, type FileFormat, type HandlerDefinition } from "./FormatHandler";
+import { PriorityQueue } from "./PriorityQueue";
 
 export interface CostEntry {
   reason: string;
@@ -575,7 +574,7 @@ export class TraversionGraph {
     simpleMode: boolean,
     isCancelled?: () => boolean | Promise<boolean>,
   ) {
-    return comlink.proxy(this.searchPath(from, to, simpleMode, isCancelled));
+    return this.searchPath(from, to, simpleMode, isCancelled);
   }
 
   private calculateAdaptiveCosts(path: ConvertPathNode[]): CostEntry[] {
@@ -623,5 +622,3 @@ export class TraversionGraph {
     return costs;
   }
 }
-
-if (typeof document === "undefined") comlink.expose(TraversionGraph);

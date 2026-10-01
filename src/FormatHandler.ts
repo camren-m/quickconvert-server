@@ -216,7 +216,7 @@ export interface FormatHandler extends HandlerDefinition {
     inputFormat: FileFormat,
     outputFormat: FileFormat,
     args?: string[],
-    ctx?: import("./ui/ProgressStore.js").ConvertContext,
+    ctx?: import("./ProgressStore.js").ConvertContext,
   ) => Promise<FileData[]>;
 }
 

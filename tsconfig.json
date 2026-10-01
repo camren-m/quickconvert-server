@@ -1,17 +1,16 @@
 {
   "compilerOptions": {
-    "target": "ES2022",
-    "useDefineForClassFields": true,
+    "outDir": "dist/",
+    "rootDir": "./src",
+    "target": "ESNext",
     "module": "ESNext",
-    "lib": ["ES2023", "DOM", "DOM.Iterable"],
-    "types": ["vite/client", "node", "@types/pdfkit"],
+    "lib": ["ESNext"],
+    "types": ["node", "@types/pdfkit"],
     "skipLibCheck": true,
     /* Bundler mode */
     "moduleResolution": "bundler",
-    "allowImportingTsExtensions": true,
     "verbatimModuleSyntax": true,
     "moduleDetection": "force",
-    "noEmit": true,
     "allowJs": true,
     /* Linting */
     "strict": true,
@@ -44,7 +43,6 @@
     "src/handlers/qoi-fu/**/*",
     "src/handlers/qoa-fu/**/*",
     "src/handlers/sppd/**/*",
-    "src/handlers/espeakng.js/**/*",
     "src/handlers/image-to-txt/src/app.ts",
     "src/handlers/image-to-txt/src/generate.ts",
     "src/handlers/terraria-wld-parser/**/*"

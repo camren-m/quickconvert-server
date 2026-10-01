@@ -1,13 +1,15 @@
-import type { FileData, FileFormat, FormatHandler } from "../FormatHandler.ts";
-import type { ConvertContext } from "../ui/ProgressStore.js";
+import type { FileData, FileFormat, FormatHandler } from "../FormatHandler";
+import type { ConvertContext } from "../ProgressStore.js";
 
-import { FFmpeg } from "@ffmpeg/ffmpeg";
-import type { LogEvent } from "@ffmpeg/ffmpeg";
+import { spawn, type ChildProcess } from "node:child_process";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import mime from "mime";
-import normalizeMimeType from "../normalizeMimeType.ts";
-import CommonFormats, { Category } from "src/CommonFormats.ts";
-import { InitializationError } from "src/errors.ts";
+import normalizeMimeType from "../normalizeMimeType";
+import CommonFormats, { Category } from "src/CommonFormats";
+import { InitializationError } from "src/errors";
 
 class FFmpegHandler implements FormatHandler {
   static formatNames: Map<string, string> = new Map([
@@ -27,81 +29,118 @@ class FFmpegHandler implements FormatHandler {
   public name: string = "FFmpeg";
   public supportedFormats: FileFormat[] = [];
   public ready: boolean = false;
-  public offload: boolean = true;
+  public offload: boolean = false;
 
-  #ffmpeg?: FFmpeg;
+  #ffmpegPath: string = process.env.FFMPEG_PATH || "ffmpeg";
+  #activeProcesses = new Set<ChildProcess>();
 
-  #stdout: string = "";
-  #boundStdoutHandler = (log: LogEvent) => {
-    this.#stdout += log.message + "\n";
-  };
-  clearStdout() {
-    this.#stdout = "";
-  }
-  async getStdout(callback: () => void | Promise<void>) {
-    if (!this.#ffmpeg) return "";
-    this.clearStdout();
-    this.#ffmpeg.on("log", this.#boundStdoutHandler);
-    await callback();
-    this.#ffmpeg.off("log", this.#boundStdoutHandler);
-    return this.#stdout;
-  }
-
-  async loadFFmpeg() {
-    if (!this.#ffmpeg) return;
-    return await this.#ffmpeg.load({
-      coreURL: "/convert/wasm/ffmpeg-core.js",
-    });
-  }
   terminateFFmpeg() {
-    if (!this.#ffmpeg) return;
-    this.#ffmpeg.terminate();
+    for (const child of this.#activeProcesses) child.kill("SIGTERM");
   }
-  async reloadFFmpeg() {
-    if (!this.#ffmpeg) return;
-    this.terminateFFmpeg();
-    this.#ffmpeg = new FFmpeg();
-    await this.loadFFmpeg();
-  }
-  /**
-   * FFmpeg tends to run out of memory (?) with an "index out of bounds"
-   * message sometimes. Other times it just stalls, irrespective of any timeout.
-   *
-   * This wrapper restarts FFmpeg when it crashes with that OOB error, and
-   * forces a Promise-level timeout as a fallback for when it stalls.
-   * @param args CLI arguments, same as in `FFmpeg.exec()`.
-   * @param timeout Max execution time in milliseconds. `-1` for no timeout (default).
-   * @param attempts Amount of times to attempt execution. Default is 1.
-   */
-  async execSafe(args: string[], timeout: number = -1, attempts: number = 1): Promise<void> {
-    if (!this.#ffmpeg) throw new InitializationError("Handler not initialized.");
-    try {
-      if (timeout === -1) {
-        await this.#ffmpeg.exec(args);
-      } else {
-        await Promise.race([
-          this.#ffmpeg.exec(args, timeout),
-          new Promise((_, reject) => setTimeout(reject, timeout)),
-        ]);
+
+  async execSafe(
+    args: string[],
+    timeout: number = -1,
+    ctx?: ConvertContext,
+    cwd?: string,
+  ): Promise<string> {
+    ctx?.throwIfAborted();
+
+    return await new Promise((resolve, reject) => {
+      const child = spawn(this.#ffmpegPath, args, {
+        cwd,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      this.#activeProcesses.add(child);
+
+      let stdout = "";
+      let stderr = "";
+      let stdoutPending = "";
+      let stderrPending = "";
+      let processedSeconds = 0;
+      let timedOut = false;
+      let settled = false;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+
+      const abortHandler = () => child.kill("SIGTERM");
+      const cleanup = () => {
+        if (timer) clearTimeout(timer);
+        ctx?.signal.removeEventListener("abort", abortHandler);
+        this.#activeProcesses.delete(child);
+      };
+      const logStderr = (text: string) => {
+        stderrPending += text;
+        const lines = stderrPending.split(/\r?\n/);
+        stderrPending = lines.pop() || "";
+        for (const line of lines) {
+          if (line) ctx?.log(line, "warn");
+        }
+      };
+
+      child.stdout?.on("data", (chunk: Buffer) => {
+        const text = chunk.toString();
+        stdout += text;
+        stdoutPending += text;
+        const lines = stdoutPending.split(/\r?\n/);
+        stdoutPending = lines.pop() || "";
+        for (const line of lines) {
+          if (line.startsWith("out_time_ms=")) {
+            const time = Number(line.slice("out_time_ms=".length));
+            if (Number.isFinite(time)) processedSeconds = time / 1_000_000;
+          } else if (line === "progress=continue") {
+            ctx?.progress(`Transcoding... (${processedSeconds.toFixed(1)}s processed)`, (p) =>
+              Math.min(0.95, p + 0.001),
+            );
+          }
+        }
+      });
+      child.stderr?.on("data", (chunk: Buffer) => {
+        const text = chunk.toString();
+        stderr += text;
+        logStderr(text);
+      });
+      child.once("error", (error) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(
+          new InitializationError(
+            `Unable to start FFmpeg at "${this.#ffmpegPath}". Ensure FFmpeg is installed or set FFMPEG_PATH. ${error.message}`,
+          ),
+        );
+      });
+      child.once("close", (code, signal) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        if (stderrPending) ctx?.log(stderrPending, "warn");
+
+        const output = `${stderr}\n${stdout}`;
+        if (ctx?.signal.aborted) {
+          reject(new DOMException("Conversion cancelled", "AbortError"));
+        } else if (timedOut) {
+          reject(new Error(`FFmpeg timed out after ${timeout}ms.\n${output}`));
+        } else if (code !== 0) {
+          reject(new Error(output || `FFmpeg exited with code ${code ?? signal}.`));
+        } else {
+          resolve(output);
+        }
+      });
+
+      ctx?.signal.addEventListener("abort", abortHandler, { once: true });
+      if (ctx?.signal.aborted) abortHandler();
+      if (timeout !== -1) {
+        timer = setTimeout(() => {
+          timedOut = true;
+          child.kill("SIGKILL");
+        }, timeout);
       }
-    } catch (e) {
-      if (!e || (typeof e === "string" && e.includes("out of bounds") && attempts > 1)) {
-        await this.reloadFFmpeg();
-        return await this.execSafe(args, timeout, attempts - 1);
-      }
-      console.error(e);
-      throw e;
-    }
+    });
   }
 
   async init() {
-    this.#ffmpeg = new FFmpeg();
-    await this.loadFFmpeg();
-
     const getMuxerDetails = async (muxer: string) => {
-      const stdout = await this.getStdout(async () => {
-        await this.execSafe(["-hide_banner", "-h", "muxer=" + muxer], 3000, 5);
-      });
+      const stdout = await this.execSafe(["-hide_banner", "-h", "muxer=" + muxer], 3000);
 
       return {
         extension: stdout.split("Common extensions: ")[1].split(".")[0].split(",")[0],
@@ -109,10 +148,11 @@ class FFmpegHandler implements FormatHandler {
       };
     };
 
-    const stdout = await this.getStdout(async () => {
-      await this.execSafe(["-formats", "-hide_banner"], 3000, 5);
-    });
-    const lines = stdout.split(" --\n")[1].split("\n");
+    const stdout = await this.execSafe(["-formats", "-hide_banner"], 3000);
+    const formatLines = stdout.split(/\r?\n/);
+    const separatorIndex = formatLines.findIndex((line) => /^\s*-{2,}\s*$/.test(line));
+    if (separatorIndex < 0) throw new InitializationError("Unable to parse FFmpeg formats.");
+    const lines = formatLines.slice(separatorIndex + 1);
 
     for (let line of lines) {
       let len;
@@ -195,7 +235,7 @@ class FFmpegHandler implements FormatHandler {
       return priorityIndexB - priorityIndexA;
     });
 
-    // AV1 doesn't seem to be included in WASM FFmpeg
+    // AV1 image support is excluded because it cannot be used reliably here.
     this.supportedFormats.splice(
       this.supportedFormats.findIndex((c) => c.mime === "image/avif"),
       1,
@@ -237,7 +277,7 @@ class FFmpegHandler implements FormatHandler {
     });
 
     // Add .mts (AVCHD) support — camcorder footage using the MPEG-TS container.
-    // FFmpeg auto-discovers "mpegts" but assigns the ".ts" extension, leaving
+    // FFmpeg auto-discovers "mpegts" but assigns the "" extension, leaving
     // ".mts" files (JVC, Sony, Panasonic AVCHD camcorders) unrecognised.
     this.supportedFormats.push({
       name: "AVCHD Video",
@@ -292,8 +332,6 @@ class FFmpegHandler implements FormatHandler {
       CommonFormats.OGG.builder("ogg").named("Ogg Opus Audio").withFormat("ogg-opus").allowTo(),
     );
 
-    this.#ffmpeg.terminate();
-
     this.ready = true;
   }
 
@@ -304,95 +342,60 @@ class FFmpegHandler implements FormatHandler {
     args?: string[],
     ctx?: ConvertContext,
   ): Promise<FileData[]> {
-    if (!this.#ffmpeg) {
+    if (!this.ready) {
       throw new InitializationError("Handler not initialized.");
     }
 
     ctx?.throwIfAborted();
-    ctx?.log("Reloading FFmpeg...");
-    await this.reloadFFmpeg();
+    if (inputFiles.length === 0) throw new Error("At least one input file is required.");
 
-    if (ctx) {
-      const abortHandler = () => {
-        ctx.log("Abort signal received — terminating FFmpeg.", "error");
-        this.terminateFFmpeg();
-      };
-      ctx.signal.addEventListener("abort", abortHandler, { once: true });
+    const workingDirectory = await mkdtemp(join(tmpdir(), "quickconvert-"));
+    try {
+      let forceFPS = 0;
+      if (inputFormat.mime === "image/png" || inputFormat.mime === "image/jpeg") {
+        forceFPS = inputFiles.length < 30 ? 1 : 30;
+      }
 
-      this.#ffmpeg.on("log", ({ message, type }) => {
-        let level: "log" | "error" | "warn" = "log";
-        if (type === "stderr") level = "warn";
-        ctx.log(message, level);
-      });
+      const listLines: string[] = [];
+      ctx?.log(`Preparing ${inputFiles.length} input files...`);
+      for (const [index, file] of inputFiles.entries()) {
+        ctx?.throwIfAborted();
+        const entryName = `file_${index}.${inputFormat.extension}`;
+        await writeFile(join(workingDirectory, entryName), file.bytes);
+        listLines.push(`file '${entryName}'`);
+        if (forceFPS) listLines.push(`duration ${1 / forceFPS}`);
+      }
+      await writeFile(join(workingDirectory, "list.txt"), listLines.join("\n") + "\n");
 
-      this.#ffmpeg.on("progress", ({ progress, time }) => {
-        if (!Number.isFinite(progress) || progress < 0) {
-          const seconds = time / 1_000_000;
-          ctx.progress(`Transcoding... (${seconds.toFixed(1)}s processed)`, (p) =>
-            Math.min(0.95, p + 0.001),
-          );
-        } else {
-          ctx.progress(`Transcoding...`, Math.max(0, Math.min(0.99, progress)));
-        }
-      });
-    }
+      const command = ["-hide_banner", "-progress", "pipe:1", "-nostats", "-f", "concat", "-safe", "0", "-i", "list.txt", "-f", outputFormat.internal];
+      if (outputFormat.mime === "video/mp4") {
+        command.push("-pix_fmt", "yuv420p");
+      } else if (outputFormat.internal === "dvd") {
+        command.push("-vf", "setsar=1", "-target", "ntsc-dvd", "-pix_fmt", "rgb24");
+      } else if (outputFormat.internal === "vcd") {
+        command.push("-vf", "scale=352:288,setsar=1", "-target", "pal-vcd", "-pix_fmt", "rgb24");
+      } else if (outputFormat.internal === "asf") {
+        command.push("-b:v", "15M", "-b:a", "192k");
+      } else if (outputFormat.format === "ogg-vorbis") {
+        command.push("-c:a", "libvorbis");
+      } else if (outputFormat.format === "ogg-opus") {
+        command.push("-c:a", "libopus");
+      }
+      if (args) command.push(...args);
+      command.push("output");
 
-    let forceFPS = 0;
-    if (inputFormat.mime === "image/png" || inputFormat.mime === "image/jpeg") {
-      forceFPS = inputFiles.length < 30 ? 1 : 30;
-    }
+      let stdout = "";
+      let executionFailed = false;
+      try {
+        stdout = await this.execSafe(command, -1, ctx, workingDirectory);
+      } catch (error) {
+        ctx?.throwIfAborted();
+        executionFailed = true;
+        stdout = error instanceof Error ? error.message : String(error);
+      }
 
-    let fileIndex = 0;
-    let listString = "";
-    ctx?.log(`Preparing ${inputFiles.length} input files...`);
-    for (const file of inputFiles) {
       ctx?.throwIfAborted();
-      const entryName = `file_${fileIndex++}.${inputFormat.extension}`;
-      await this.#ffmpeg.writeFile(entryName, new Uint8Array(file.bytes));
-      listString += `file '${entryName}'\n`;
-      if (forceFPS) listString += `duration ${1 / forceFPS}\n`;
-    }
-    await this.#ffmpeg.writeFile("list.txt", new TextEncoder().encode(listString));
-
-    const command = [
-      "-hide_banner",
-      "-f",
-      "concat",
-      "-safe",
-      "0",
-      "-i",
-      "list.txt",
-      "-f",
-      outputFormat.internal,
-    ];
-    if (outputFormat.mime === "video/mp4") {
-      command.push("-pix_fmt", "yuv420p");
-    } else if (outputFormat.internal === "dvd") {
-      command.push("-vf", "setsar=1", "-target", "ntsc-dvd", "-pix_fmt", "rgb24");
-    } else if (outputFormat.internal === "vcd") {
-      command.push("-vf", "scale=352:288,setsar=1", "-target", "pal-vcd", "-pix_fmt", "rgb24");
-    } else if (outputFormat.internal === "asf") {
-      command.push("-b:v", "15M", "-b:a", "192k");
-    } else if (outputFormat.format === "ogg-vorbis") {
-      command.push("-c:a", "libvorbis");
-    } else if (outputFormat.format === "ogg-opus") {
-      command.push("-c:a", "libopus");
-    }
-    if (args) command.push(...args);
-    command.push("output");
-
-    const stdout = await this.getStdout(async () => {
-      await this.#ffmpeg!.exec(command);
-    });
-
-    ctx?.throwIfAborted();
-    ctx?.log("Cleaning up input files...");
-    for (let i = 0; i < fileIndex; i++) {
-      const entryName = `file_${i}.${inputFormat.extension}`;
-      await this.#ffmpeg.deleteFile(entryName);
-    }
-
-    if (stdout.includes("Conversion failed!\n")) {
+      if (executionFailed || stdout.includes("Conversion failed!\n")) {
       ctx?.log("Conversion failed, attempting auto-fix...", "error");
       const oldArgs = args ?? [];
       if (stdout.includes(" not divisible by") && !oldArgs.includes("-vf")) {
@@ -454,40 +457,32 @@ class FFmpegHandler implements FormatHandler {
       }
 
       throw stdout;
+      }
+
+      ctx?.log("Reading output file...");
+      let bytes: Uint8Array;
+      try {
+        bytes = new Uint8Array(await readFile(join(workingDirectory, "output")));
+      } catch (error) {
+        ctx?.log(`Output file not created: ${error}`, "error");
+        throw new Error(`Output file not created: ${error}`);
+      }
+
+      if (bytes.length === 0) {
+        ctx?.log("FFmpeg failed to produce output file", "error");
+        throw new Error("FFmpeg failed to produce output file");
+      }
+
+      const baseName = inputFiles[0].name.split(".").slice(0, -1).join(".");
+      const name = baseName + "." + outputFormat.extension;
+
+      ctx?.progress("Conversion complete!", 1);
+      ctx?.log(`Successfully converted to ${name} (${bytes.length} bytes)`);
+
+      return [{ bytes, name }];
+    } finally {
+      await rm(workingDirectory, { recursive: true, force: true });
     }
-
-    let bytes: Uint8Array;
-
-    ctx?.log("Reading output file...");
-    let fileData;
-    try {
-      fileData = await this.#ffmpeg.readFile("output");
-    } catch (e) {
-      ctx?.log(`Output file not created: ${e}`, "error");
-      throw `Output file not created: ${e}`;
-    }
-
-    if (!fileData || (fileData instanceof Uint8Array && fileData.length === 0)) {
-      ctx?.log("FFmpeg failed to produce output file", "error");
-      throw "FFmpeg failed to produce output file";
-    }
-    if (!(fileData instanceof Uint8Array)) {
-      const encoder = new TextEncoder();
-      bytes = encoder.encode(fileData);
-    } else {
-      bytes = new Uint8Array(fileData?.buffer);
-    }
-
-    await this.#ffmpeg.deleteFile("output");
-    await this.#ffmpeg.deleteFile("list.txt");
-
-    const baseName = inputFiles[0].name.split(".").slice(0, -1).join(".");
-    const name = baseName + "." + outputFormat.extension;
-
-    ctx?.progress("Conversion complete!", 1);
-    ctx?.log(`Successfully converted to ${name} (${bytes.length} bytes)`);
-
-    return [{ bytes, name }];
   }
 }
 

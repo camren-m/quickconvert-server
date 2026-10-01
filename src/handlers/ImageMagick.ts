@@ -8,10 +8,11 @@ import {
 } from "@imagemagick/magick-wasm";
 
 import mime from "mime";
-import normalizeMimeType from "../normalizeMimeType.ts";
-import CommonFormats from "src/CommonFormats.ts";
-import type { FileData, FileFormat, FormatHandler } from "../FormatHandler.ts";
-import type { ConvertContext } from "../ui/ProgressStore.js";
+import normalizeMimeType from "../normalizeMimeType";
+import { readFileSync } from "node:fs"
+import CommonFormats from "src/CommonFormats";
+import type { FileData, FileFormat, FormatHandler } from "../FormatHandler";
+import type { ConvertContext } from "../ProgressStore.js";
 
 class ImageMagickHandler implements FormatHandler {
   public name: string = "ImageMagick";
@@ -22,9 +23,8 @@ class ImageMagickHandler implements FormatHandler {
   public offload: boolean = true;
 
   async init() {
-    const wasmLocation = "/convert/wasm/magick.wasm";
-    const wasmBuffer = await fetch(wasmLocation).then((r) => r.arrayBuffer());
-    const wasmBytes = new Uint8Array(wasmBuffer);
+    const wasmLocation = "./node_modules/@imagemagick/magick-wasm/dist/magick.wasm";
+    const wasmBytes = readFileSync(wasmLocation);
 
     await initializeImageMagick(wasmBytes);
 

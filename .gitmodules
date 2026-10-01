@@ -13,9 +13,6 @@
 [submodule "src/handlers/image-to-txt"]
 	path = src/handlers/image-to-txt
 	url = https://github.com/zipsegv/image-to-txt
-[submodule "src/handlers/espeakng.js"]
-	path = src/handlers/espeakng.js
-	url = https://github.com/TheZipCreator/espeakng.js
 [submodule "src/handlers/rpgmvp-decrypter"]
 	path = src/handlers/rpgmvp-decrypter
 	url = https://github.com/ConnorTippets/RPG-Maker-MV-Decrypter.git

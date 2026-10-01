@@ -1,5 +1,5 @@
 // Custom Error types
-// import { BadMagicError, EOFError, InitializationError } from "src/errors.ts";
+// import { BadMagicError, EOFError, InitializationError } from "src/errors;
 export class BadMagicError extends Error {
   constructor(message: string) {
     super(message);
